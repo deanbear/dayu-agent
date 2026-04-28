@@ -262,14 +262,18 @@ def _build_tool_calls_payload(
         raw_args = tc.get("arguments", "")
         if not isinstance(raw_args, str):
             raw_args = json.dumps(raw_args)
-        tool_calls_payload.append({
+        entry: ToolCallPayload = {
             "id": tc["id"],
             "type": "function",
             "function": {
                 "name": tc["name"],
                 "arguments": raw_args,
             },
-        })
+        }
+        tc_extra = tc.get("extra_content")
+        if tc_extra is not None:
+            entry["extra_content"] = tc_extra
+        tool_calls_payload.append(entry)
     return tool_calls_payload
 
 
@@ -781,6 +785,9 @@ class AsyncAgent:
                     tool_calls_data[tool_call_id]["arguments"] = event.data.get("arguments", {})
                     tool_calls_data[tool_call_id]["index_in_iteration"] = event.data.get("index_in_iteration", 0)
                     tool_calls_data[tool_call_id]["result"] = event.data.get("result")
+                    tc_extra = event.data.get("extra_content")
+                    if tc_extra is not None:
+                        tool_calls_data[tool_call_id]["extra_content"] = tc_extra
                     tool_name = tool_calls_data[tool_call_id]["name"]
                     tool_args = tool_calls_data[tool_call_id]["arguments"]
                     result = tool_calls_data[tool_call_id].get("result", {})

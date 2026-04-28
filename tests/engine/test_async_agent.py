@@ -2200,14 +2200,85 @@ class TestAsyncAgentReasoningContent:
         assert "reasoning_content" not in assistant_msgs[0]
 
 
+class TestGeminiExtraContentRoundtrip:
+    """验证 Gemini extra_content 从 tool_call_result 事件透传到下一轮 assistant message。"""
+
+    @pytest.mark.asyncio
+    async def test_extra_content_roundtrip(self):
+        """extra_content 应出现在第二轮请求的 assistant message tool_calls 中。"""
+        tool_args = {"query": "杭州天气"}
+        extra_content = {"google": {"thought_signature": "EjQKMgEMOdbH..."}}
+
+        # 构造第一轮事件，tool_call_result 带 extra_content
+        tc_result_event = tool_call_result(
+            "call_1",
+            {"ok": True, "value": "sunny"},
+            name="search_web",
+            arguments=tool_args,
+            index_in_iteration=0,
+        )
+        tc_result_event.data["extra_content"] = extra_content
+
+        runner = DummyRunner([
+            [
+                tool_call_dispatched("call_1", "search_web", tool_args, index_in_iteration=0),
+                tc_result_event,
+                tool_calls_batch_done(["call_1"], ok=1, error=0, timeout=0, cancelled=0),
+                content_complete(""),
+                done_event(),
+            ],
+            [content_delta("done"), content_complete("done"), done_event()],
+        ])
+        agent = AsyncAgent(runner)
+        async for _ in agent.run("test"):
+            pass
+
+        # 验证第二轮请求的 assistant message 里 tool_calls 带了 extra_content
+        second_messages = runner.calls[1]["messages"]
+        assistant_msg = next(m for m in second_messages if m.get("role") == "assistant")
+        tool_calls = assistant_msg.get("tool_calls", [])
+        assert len(tool_calls) == 1
+        assert tool_calls[0].get("extra_content") == extra_content
+
+    @pytest.mark.asyncio
+    async def test_no_extra_content_when_absent(self):
+        """非 Gemini 场景下 tool_calls 不应包含 extra_content 字段。"""
+        tool_args = {"path": "test.txt"}
+        runner = DummyRunner([
+            [
+                tool_call_dispatched("call_1", "tool", tool_args, index_in_iteration=0),
+                tool_call_result(
+                    "call_1",
+                    {"ok": True, "value": "ok"},
+                    name="tool",
+                    arguments=tool_args,
+                    index_in_iteration=0,
+                ),
+                tool_calls_batch_done(["call_1"], ok=1, error=0, timeout=0, cancelled=0),
+                content_complete(""),
+                done_event(),
+            ],
+            [content_delta("done"), content_complete("done"), done_event()],
+        ])
+        agent = AsyncAgent(runner)
+        async for _ in agent.run("test"):
+            pass
+
+        second_messages = runner.calls[1]["messages"]
+        assistant_msg = next(m for m in second_messages if m.get("role") == "assistant")
+        tool_calls = assistant_msg.get("tool_calls", [])
+        assert len(tool_calls) == 1
+        assert "extra_content" not in tool_calls[0]
+
+
 class TestAsyncAgentImport:
     """测试 AsyncAgent 导入"""
-    
+
     def test_can_import_async_agent(self):
         """测试可以导入 AsyncAgent"""
         from dayu.engine import AsyncAgent
-        
+
         runner = DummyRunner([])
         agent = AsyncAgent(runner)
-        
+
         assert isinstance(agent, AsyncAgent)

@@ -12,7 +12,8 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Dict, List, cast
+from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, List, cast
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -1297,12 +1298,10 @@ async def test_parse_stream_gemini_parallel_tool_calls_without_index() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_payload_logs_enumerate_fallback_when_index_missing(
+async def test_handle_payload_logs_fallback_when_index_missing(
     monkeypatch: Any,
 ) -> None:
-    """验证 enumerate 补齐分支在 ``debug_tool_delta=True`` 时打印可观测日志。
-
-    该日志是 Gemini 行为漂移时唯一的定位线索，不能完全静默。
+    """验证 index 补齐分支在 ``debug_tool_delta=True`` 时打印可观测日志。
 
     Args:
         monkeypatch: pytest monkeypatch 工具，用于替换 ``Log.debug``。
@@ -1343,10 +1342,187 @@ async def test_handle_payload_logs_enumerate_fallback_when_index_missing(
     await _collect_events(_parse_stream(parser, response))
 
     fallback_messages = [
-        msg for msg in debug_collector.messages if "缺失 index" in msg and "enumerate" in msg
+        msg for msg in debug_collector.messages if "缺失 index" in msg and "按 id=" in msg
     ]
     assert len(fallback_messages) == 2, (
-        f"期望两条 enumerate fallback 日志，实际: {fallback_messages}"
+        f"期望两条 index 补齐日志，实际: {fallback_messages}"
     )
-    assert any("下标 0" in msg for msg in fallback_messages)
-    assert any("下标 1" in msg for msg in fallback_messages)
+
+
+@pytest.mark.asyncio
+async def test_gemini_cross_chunk_parallel_tool_calls() -> None:
+    """验证 Gemini 跨 chunk 分发的并行 tool call 正确分配独立 index（issue #82）。
+
+    Gemini 并行调用 3 个工具时，每个 tool call 在独立 chunk 中发送，
+    tool_calls 数组长度均为 1 且无 index 字段。
+    """
+    parser = SSEStreamParser(
+        name="gemini",
+        request_id="req_cross_chunk",
+        running_config=_RunningConfigStub(),
+    )
+
+    chunks = []
+    for i, (tc_id, query) in enumerate([
+        ("call-aaa", "杭州天气"),
+        ("call-bbb", "北京天气"),
+        ("call-ccc", "上海天气"),
+    ]):
+        chunks.append(json.dumps({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {"name": "search_web", "arguments": json.dumps({"query": query})},
+                    }],
+                },
+            }],
+        }))
+    chunks.append(json.dumps({
+        "choices": [{"delta": {"role": "assistant"}, "finish_reason": "stop"}],
+    }))
+
+    response = _ResponseStub(
+        [f"data: {c}\n\n".encode("utf-8") for c in chunks] + [b"data: [DONE]\n\n"]
+    )
+    await _collect_events(_parse_stream(parser, response))
+    result = parser.get_result()
+
+    assert len(result.tool_calls) == 3
+    ids = [tc["id"] for tc in result.tool_calls]
+    assert ids == ["call-aaa", "call-bbb", "call-ccc"]
+    assert result.tool_calls[0]["arguments"] == {"query": "杭州天气"}
+    assert result.tool_calls[1]["arguments"] == {"query": "北京天气"}
+    assert result.tool_calls[2]["arguments"] == {"query": "上海天气"}
+    assert result.validation_errors == []
+
+
+# ─── Gemini extra_content / thinking 兼容测试 ───
+
+
+@pytest.mark.asyncio
+async def test_gemini_tool_call_preserves_extra_content() -> None:
+    """验证 Gemini tool call 上的 extra_content（含 thought_signature）在组装结果中保留。"""
+    parser = SSEStreamParser(
+        name="gemini",
+        request_id="req_extra_content",
+        running_config=_RunningConfigStub(),
+    )
+
+    extra_content = {"google": {"thought_signature": "EjQKMgEMOdbH..."}}
+    payload = json.dumps({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "extra_content": extra_content,
+                    "function": {"arguments": '{"query":"test"}', "name": "search_web"},
+                    "id": "call_001",
+                    "type": "function",
+                }],
+            },
+            "finish_reason": "stop",
+        }],
+    })
+
+    response = _ResponseStub([
+        f"data: {payload}\n\n".encode("utf-8"),
+        b"data: [DONE]\n\n",
+    ])
+    await _collect_events(_parse_stream(parser, response))
+    result = parser.get_result()
+
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].get("extra_content") == extra_content
+    assert result.protocol_errors == []
+    assert result.validation_errors == []
+
+
+@pytest.mark.asyncio
+async def test_gemini_thinking_content_extracted_to_reasoning() -> None:
+    """验证 Gemini thinking 内容（含 <thought> 标签）被正确分离为 reasoning_content。"""
+    parser = SSEStreamParser(
+        name="gemini",
+        request_id="req_thinking",
+        running_config=_RunningConfigStub(),
+        content_reasoning_tag="thought",
+    )
+
+    thought_signature = "EtIICs8IAQw51sdb3EXr..."
+    chunk1 = json.dumps({
+        "choices": [{
+            "delta": {
+                "content": "<thought>**Analyzing**\n\n",
+                "extra_content": {"google": {"thought": True}},
+                "role": "assistant",
+            },
+        }],
+    })
+    chunk2 = json.dumps({
+        "choices": [{
+            "delta": {
+                "content": "</thought>",
+                "tool_calls": [{
+                    "extra_content": {"google": {"thought_signature": thought_signature}},
+                    "function": {"arguments": '{"q":"test"}', "name": "search"},
+                    "id": "call_003",
+                    "type": "function",
+                }],
+            },
+        }],
+    })
+    chunk3 = json.dumps({
+        "choices": [{"delta": {"role": "assistant"}, "finish_reason": "stop"}],
+    })
+
+    response = _ResponseStub([
+        f"data: {chunk1}\n\n".encode("utf-8"),
+        f"data: {chunk2}\n\n".encode("utf-8"),
+        f"data: {chunk3}\n\n".encode("utf-8"),
+        b"data: [DONE]\n\n",
+    ])
+    events = await _collect_events(_parse_stream(parser, response))
+    result = parser.get_result()
+
+    # content 必须包含原始标签（用于历史回传），而 reasoning_content 是脱水后的内容（用于 UI）
+    assert result.content == "<thought>**Analyzing**\n\n</thought>"
+    assert result.reasoning_content == "**Analyzing**\n\n"
+
+    # 被转为 REASONING_DELTA 事件
+    reasoning_events = [e for e in events if e.type == EventType.REASONING_DELTA]
+    assert len(reasoning_events) == 1
+    assert reasoning_events[0].data == "**Analyzing**\n\n"
+
+    # tool call 组装正确，含 extra_content
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].get("extra_content") == {"google": {"thought_signature": thought_signature}}
+
+
+@pytest.mark.asyncio
+async def test_sse_parser_pos_fallback_continuation():
+    """验证当后续 chunk 缺失 index 和 id 时，通过 pos (数组下标) 自动归位。"""
+    running_config = MagicMock()
+    running_config.debug_tool_delta = True
+
+    parser = SSEStreamParser(
+        name="test-runner",
+        running_config=running_config,
+        request_id="req_pos"
+    )
+
+    # 模拟首个 chunk 带 id，后续 chunk 丢了 id 且都没有 index
+    chunks = [
+        {"choices": [{"delta": {"tool_calls": [{"id": "call_1", "function": {"name": "tool"}}]}}]},  # pos=0
+        {"choices": [{"delta": {"tool_calls": [{"function": {"arguments": "{\"a\":"}}]}}]},      # pos=0
+        {"choices": [{"delta": {"tool_calls": [{"function": {"arguments": "1}"}}]}}]}            # pos=0
+    ]
+
+    for chunk in chunks:
+        async for _ in parser._handle_payload(json.dumps(chunk)):
+            pass
+
+    tool_calls, errors = parser._assemble_tool_calls()
+    assert len(tool_calls) == 1
+    assert len(errors) == 0
+    assert tool_calls[0]["id"] == "call_1"
+    assert tool_calls[0]["arguments"] == {"a": 1}

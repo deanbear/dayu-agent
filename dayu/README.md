@@ -163,6 +163,7 @@ flowchart LR
   - 可选托管 `reply outbox` 真源与状态机，但不会在 internal success 时自动把 answer 写入 outbox
 - `Agent`
   - 只关心 messages、工具、预算、取消信号和 trace 上下文
+  - 负责执行模型交互逻辑，产出流式内容与分离后的推理事件
   - 不理解 `ticker`、场景语义、配置文件结构或业务流程
 
 ### 2.2 `dayu.cli prompt` 时序图
@@ -487,7 +488,7 @@ class ExecutionOptions:
 ```python
 class AppEventType(Enum):
     CONTENT_DELTA = "content_delta"
-    REASONING_DELTA = "reasoning_delta"
+    REASONING_DELTA = "reasoning_delta"  # 推理/思维链增量，用于将模型的思考过程与最终回答分离
     FINAL_ANSWER = "final_answer"
     TOOL_EVENT = "tool_event"
     WARNING = "warning"

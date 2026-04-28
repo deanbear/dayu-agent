@@ -33,8 +33,12 @@ from .events import (
     tool_call_delta,
     tool_call_start,
 )
+from .xml_extractor import StreamingXMLTagExtractor
 from dayu.contracts.cancellation import CancelledError as EngineCancelledError, CancellationToken
 from dayu.log import Log
+
+from dayu.engine.cancellation import await_or_cancel as _await_or_cancel
+from dayu.engine.cancellation import create_cancellation_waiter as _create_cancellation_waiter
 
 if TYPE_CHECKING:
     from aiohttp import ClientResponse
@@ -42,10 +46,6 @@ if TYPE_CHECKING:
 
 MODULE = "ENGINE.SSE_PARSER"
 _DEFAULT_STREAM_IDLE_HEARTBEAT_SEC = 10.0
-
-
-from dayu.engine.cancellation import await_or_cancel as _await_or_cancel
-from dayu.engine.cancellation import create_cancellation_waiter as _create_cancellation_waiter
 
 
 @dataclass
@@ -117,6 +117,7 @@ def should_log_debug(
     return True
 
 
+
 class SSEStreamParser:
     """
     SSE 流式响应解析器。
@@ -143,7 +144,8 @@ class SSEStreamParser:
         request_id: str,
         running_config: "AsyncOpenAIRunnerRunningConfig",
         cancellation_token: CancellationToken | None = None,
-    ):
+        content_reasoning_tag: str | None = None,
+    ) -> None:
         """
         初始化 SSE 流解析器。
 
@@ -151,6 +153,8 @@ class SSEStreamParser:
             name: Runner 名称（用于日志前缀）。
             request_id: 请求 ID（用于日志前缀）。
             running_config: Runner 运行时配置。
+            cancellation_token: 可选的取消令牌。
+            content_reasoning_tag: 可选的 XML 推理标签名（如 "thought"），用于自适应提取。
         """
         self._name = name
         self._request_id = request_id
@@ -161,6 +165,10 @@ class SSEStreamParser:
         # 内部缓冲（在 parse_stream 期间累积）
         self._content_buffer: List[str] = []
         self._reasoning_content_buffer: List[str] = []
+
+        # 初始化 XML 标签提取器（若传入标签名则启用自适应提取）
+        tag_name = content_reasoning_tag
+        self._thought_extractor = StreamingXMLTagExtractor(tag_name or "", enabled=bool(tag_name))
         self._tool_calls_buffer: Dict[int, Dict] = {}
         self._stream_state: Dict[str, Any] = {
             "tool_calls_finished": False,
@@ -377,6 +385,9 @@ class SSEStreamParser:
         async for event in self._flush_event_data_lines(event_data_lines):
             yield event
 
+        async for event in self._yield_final_content():
+            yield event
+
     def _get_stream_idle_heartbeat_sec(self) -> float | None:
         """返回流式空闲心跳日志间隔。
 
@@ -572,8 +583,11 @@ class SSEStreamParser:
         # 3) 累积内容增量
         if "content" in delta and delta["content"]:
             text = delta["content"]
+            # [重要] 始终在内容缓冲区记录原始文本（包含 <thought> 标签）。
+            # 这样 get_result() 返回的 content 是完整的，以便下一轮请求能带回给模型。
             self._content_buffer.append(text)
-            yield content_delta(text)
+            async for event in self._yield_content_chunks(text):
+                yield event
 
         # 3.5) 累积推理内容增量（thinking 模式思维链）
         if "reasoning_content" in delta and delta["reasoning_content"]:
@@ -602,35 +616,69 @@ class SSEStreamParser:
                     body=json.dumps({"tool_calls": tool_calls}, ensure_ascii=False, default=str),
                 )
                 return
-            for index, tc in enumerate(tool_calls):
+            if self._running_config.debug_tool_delta:
+                Log.debug(
+                    f"{self._log_prefix} tool_calls delta (len={len(tool_calls)}): "
+                    f"{json.dumps(tool_calls, ensure_ascii=False, default=str)[:500]}",
+                    module=MODULE,
+                )
+            for pos, tc in enumerate(tool_calls):
                 if not isinstance(tc, dict):
                     self._record_protocol_error(
                         "tool_call_incomplete",
                         "Tool call arguments incomplete or invalid",
                         body=json.dumps(
-                            [f"tool_call entry at index {index} is not object"],
+                            [f"tool_call entry at index {pos} is not object"],
                             ensure_ascii=False,
                         ),
                     )
                     continue
-                # 兼容不发 index 的 provider（如 Gemini OpenAI 兼容模式），
-                # 用数组下标补齐，使下游 _handle_tool_call_delta 无需特殊处理。
-                # 该补齐依赖 OpenAI 协议自洽性：任何 provider 若做跨 chunk 增量，
-                # 必然提供 index 归属标识；因此 "无 index" 场景下 enumerate 下标
-                # 等价于协议层应有的 index。
+                # 兼容不发 index 的 provider（如 Gemini OpenAI 兼容模式）。
+                # Gemini 可能跨 chunk 分发并行 tool call（每个 chunk 的
+                # tool_calls 数组长度为 1），enumerate 下标会重复为 0。
+                # 用 id 在已有 buffer 中查找归属，找不到则分配新 index。
                 if "index" not in tc:
+                    tc_id = tc.get("id", "")
+                    resolved = self._resolve_tool_call_index(tc_id, pos)
                     if self._running_config.debug_tool_delta:
                         Log.debug(
-                            (
-                                f"{self._log_prefix} tool_call 缺失 index，"
-                                f"使用 enumerate 下标 {index} 补齐"
-                                f"（id={tc.get('id')!r}）"
-                            ),
+                            f"{self._log_prefix} tool_call 缺失 index，"
+                            f"按 id={tc_id!r} 分配 index={resolved}",
                             module=MODULE,
                         )
-                    tc = {**tc, "index": index}
+                    tc = {**tc, "index": resolved}
                 async for event in self._handle_tool_call_delta(tc):
                     yield event
+
+    def _resolve_tool_call_index(self, tc_id: str, pos: int) -> int:
+        """为缺失 index 的 tool call 分配 buffer 索引。
+
+        策略:
+        1. 若有 id，先在已有 buffer 中查找（支持跨 chunk 续传）。
+        2. 若无 id 或 id 没找到，尝试回退到数组下标 pos (针对单工具调用场景)。
+        3. 以上均失败，则取 buffer 中最大 index + 1 作为新索引。
+
+        Args:
+            tc_id: tool call 的 id 字符串。
+            pos: 当前 tc 在 tool_calls 增量数组中的下标。
+
+        Returns:
+            分配的整数索引。
+        """
+        if tc_id:
+            for buf_idx, buf in self._tool_calls_buffer.items():
+                if buf["id"] == tc_id:
+                    return buf_idx
+            # 如果提供了 id 但没找到已有 buffer，说明这是一个全新的工具调用
+            # 不能使用 pos 兜底，否则会和 index 为 pos 的其它调用合并
+        elif pos in self._tool_calls_buffer:
+            # 仅在无 id 时，尝试通过下标 pos 归位
+            return pos
+
+        # 分配新索引
+        if self._tool_calls_buffer:
+            return max(self._tool_calls_buffer.keys()) + 1
+        return 0
 
     async def _handle_tool_call_delta(self, tc: Dict) -> AsyncIterator[StreamEvent]:
         """
@@ -639,8 +687,8 @@ class SSEStreamParser:
         本函数严格按 OpenAI 标准协议处理 tool call delta：
         - 要求 ``tc`` 必须包含合法的 ``index: int``；缺失或类型异常视为协议错误。
           非标 provider（如 Gemini OpenAI 兼容模式）不发 index 的兼容由上游
-          ``_handle_payload`` 在遍历 tool_calls 数组时用 enumerate 下标补齐后再
-          传入，本函数不做 fallback 推断。
+          ``_handle_payload`` 通过 ``_resolve_tool_call_index`` 按 id 归属补齐
+          后再传入，本函数不做 fallback 推断。
         - ``function.arguments`` 允许为字符串或 ``None``；``None`` 视为字段不存在
           安全忽略（兼容 Qwen thinking 模式在 tool call 结束帧发送
           ``arguments: null``）。其它非字符串类型仍按协议错误处理。
@@ -681,6 +729,7 @@ class SSEStreamParser:
                 "arguments_buf": "",
                 "index_in_iteration": tool_index,
                 "started": False,
+                "extra_content": None,
             },
         )
 
@@ -731,6 +780,12 @@ class SSEStreamParser:
                     f"{self._log_prefix} 记录 tool_call_id: {tc_id_raw}（index={tool_index}）",
                     module=MODULE,
                 )
+
+        # [Gemini compat] 透传 tool call 级 extra_content（含 thought_signature）。
+        # Gemini 3 系列多轮 tool calling 要求原样回传，否则 400。
+        tc_extra = tc.get("extra_content")
+        if tc_extra is not None and entry.get("extra_content") is None:
+            entry["extra_content"] = tc_extra
 
         # 记录 name（首次出现即写入）
         func_name = func.get("name", "")
@@ -815,8 +870,10 @@ class SSEStreamParser:
             try:
                 args_obj = json.loads(args_buf)
             except json.JSONDecodeError as exc:
+                # 截取前 200 字符，方便定位 Gemini 等 provider 拼接 JSON 等非标行为
+                preview = args_buf[:200] + ("..." if len(args_buf) > 200 else "")
                 validation_errors.append(
-                    f"tool_index {tool_index}: invalid arguments JSON ({exc})"
+                    f"tool_index {tool_index}: invalid arguments JSON ({exc}), raw={preview!r}"
                 )
                 continue
             if not isinstance(args_obj, dict):
@@ -825,12 +882,16 @@ class SSEStreamParser:
                 )
                 continue
 
-            tool_calls.append({
+            assembled: dict[str, Any] = {
                 "id": tc_id,
                 "name": name,
                 "arguments": args_obj,
                 "index_in_iteration": tool_index,
-            })
+            }
+            tc_extra = tc_data.get("extra_content")
+            if tc_extra is not None:
+                assembled["extra_content"] = tc_extra
+            tool_calls.append(assembled)
 
         return tool_calls, validation_errors
 
@@ -871,3 +932,45 @@ class SSEStreamParser:
                 }
             )
         return partial_tool_calls
+
+    async def _yield_content_chunks(self, text: str) -> AsyncIterator[StreamEvent]:
+        """处理并分发内容块（支持 Gemini 思维链提取）。
+
+        Args:
+            text: 待处理的原始增量文本。
+
+        Yields:
+            StreamEvent: 根据提取结果产出 content_delta 或 reasoning_delta 事件。
+
+        Raises:
+            无。
+        """
+        if not self._thought_extractor.enabled:
+            yield content_delta(text)
+            return
+
+        for extracted_text, is_thought in self._thought_extractor.process(text):
+            if is_thought:
+                self._reasoning_content_buffer.append(extracted_text)
+                yield reasoning_delta(extracted_text)
+            else:
+                yield content_delta(extracted_text)
+
+    async def _yield_final_content(self) -> AsyncIterator[StreamEvent]:
+        """冲刷并分发残留的内容块（支持 Gemini 思维链提取）。
+
+        Returns:
+            AsyncIterator[StreamEvent]: 流结束时残留的 content_delta 或 reasoning_delta 事件流。
+
+        Raises:
+            无。
+        """
+        if not self._thought_extractor.enabled:
+            return
+
+        for extracted_text, is_thought in self._thought_extractor.flush():
+            if is_thought:
+                self._reasoning_content_buffer.append(extracted_text)
+                yield reasoning_delta(extracted_text)
+            else:
+                yield content_delta(extracted_text)

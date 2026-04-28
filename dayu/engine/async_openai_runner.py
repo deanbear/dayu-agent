@@ -71,7 +71,7 @@
    - messages: OpenAI 格式的消息列表
    - stream: 是否启用流式响应（模型不支持时自动降级）
     - **extra_payloads: 额外的请求参数（优先级高于 default_extra_payloads，但不能覆盖保留字段）
-   
+
    事件类型：
    - content_delta: 内容增量
    - content_complete: 内容完成（总是触发，即使内容为空）
@@ -84,7 +84,7 @@
    - warning_event: 警告（如重试）
    - error_event: 错误（包含 error_type 和 recoverable 字段）
    - done_event: 完成
-   
+
    重试机制：
    - 网络超时/连接错误：自动重试
    - HTTP 429 限流：根据 Retry-After 头或指数退避
@@ -97,12 +97,44 @@ import json
 import time
 import uuid
 from types import ModuleType
-from typing import AsyncIterator, Callable, Dict, List, Optional, Any, TYPE_CHECKING, cast
+from typing import AsyncIterator, Dict, List, Optional, Any, TYPE_CHECKING
 from dataclasses import dataclass
 
 from dayu.contracts.agent_types import AgentMessage
 from dayu.contracts.protocols import ToolExecutionContext
 from dayu.contracts.cancellation import CancelledError as EngineCancelledError, CancellationToken
+
+from .events import (
+    EventType,
+    StreamEvent,
+    content_delta,          ## """创建内容增量事件"""
+    content_complete,       ## """创建内容完成事件"""
+    reasoning_delta,        ## """创建推理增量事件（thinking 模式思维链片段）"""
+    done_event,             ## """创建完成事件"""
+    error_event,            ## """创建错误事件"""
+    metadata_event,         ## """创建元数据事件"""
+    warning_event,          ## """创建警告事件"""
+    tool_call_dispatched,   ## """创建工具调用已发起执行事件"""
+    tool_call_result,       ## """创建工具调用结果事件"""
+    tool_call_start,        ## """创建工具调用开始事件"""
+    tool_calls_batch_ready, ## """创建工具调用批次就绪事件"""
+    tool_calls_batch_done,  ## """创建工具调用批次完成事件"""
+)
+from .xml_extractor import StreamingXMLTagExtractor
+from .protocols import ToolExecutor
+from dayu.log import Log
+from .tool_result import (
+    build_error,
+    get_error_code,
+    get_error_message,
+    get_value,
+    is_tool_success,
+    validate_tool_result_contract,
+)
+from .sse_parser import SSEStreamParser
+from dayu.engine.cancellation import await_or_cancel as _await_or_cancel
+from dayu.engine.cancellation import cancel_task_and_wait
+from dayu.engine.cancellation import create_cancellation_waiter as _create_cancellation_waiter
 
 # 可选依赖，导入失败不立即报错
 aiohttp: ModuleType | None
@@ -116,40 +148,7 @@ except ImportError:
 if TYPE_CHECKING:
     from aiohttp import ClientResponse, ClientSession, ClientTimeout
 
-from .events import (
-    EventType,
-    StreamEvent,
-    content_delta,          ## """创建内容增量事件"""
-    content_complete,       ## """创建内容完成事件"""
-    reasoning_delta,        ## """创建推理增量事件（thinking 模式思维链片段）"""
-    done_event,             ## """创建完成事件"""
-    error_event,            ## """创建错误事件"""
-    metadata_event,         ## """创建元数据事件"""
-    warning_event,          ## """创建警告事件"""
-    tool_call_dispatched,   ## """创建工具调用已发起执行事件"""
-    tool_call_delta,        ## """创建工具调用参数增量事件"""
-    tool_call_result,       ## """创建工具调用结果事件"""
-    tool_call_start,        ## """创建工具调用开始事件"""
-    tool_calls_batch_ready, ## """创建工具调用批次就绪事件"""
-    tool_calls_batch_done,  ## """创建工具调用批次完成事件"""
-)
-from .protocols import ToolExecutor
-from dayu.log import Log
-from .tool_result import (
-    build_error,
-    get_error_code,
-    get_error_message,
-    get_value,
-    is_tool_success,
-    validate_tool_result_contract,
-)
-from .sse_parser import SSEStreamParser
-
 MODULE = "ENGINE.ASYNC_OPENAI_RUNNER"
-
-from dayu.engine.cancellation import await_or_cancel as _await_or_cancel
-from dayu.engine.cancellation import cancel_task_and_wait
-from dayu.engine.cancellation import create_cancellation_waiter as _create_cancellation_waiter
 
 
 def _require_aiohttp_module() -> ModuleType:
@@ -482,7 +481,7 @@ class AsyncOpenAIRunnerRunningConfig:
 class AsyncOpenAIRunner:
     """
     异步 OpenAI Compatible Runner，支持 streaming 和工具调用
-    
+
     配置示例（llm_models.json）：
     {
       "deepseek_chat": {
@@ -500,7 +499,7 @@ class AsyncOpenAIRunner:
       }
     }
     """
-    
+
     def __init__(
         self,
         *,
@@ -542,7 +541,7 @@ class AsyncOpenAIRunner:
         if aiohttp is None:
             Log.error("aiohttp 库未安装，无法使用 AsyncOpenAIRunner", module=MODULE)
             raise ImportError("aiohttp is required for AsyncOpenAIRunner. Install with: pip install aiohttp")
-        
+
         # 创建 running_config 实例（避免默认参数共享问题）
         if running_config is None:
             running_config = AsyncOpenAIRunnerRunningConfig()
@@ -552,7 +551,7 @@ class AsyncOpenAIRunner:
             running_config.stream_idle_timeout = _DEFAULT_STREAM_IDLE_TIMEOUT_SEC
         if running_config.stream_idle_heartbeat_sec is None:
             running_config.stream_idle_heartbeat_sec = _DEFAULT_STREAM_IDLE_HEARTBEAT_SEC
-        
+
         self.endpoint_url = endpoint_url
         self.model = model
         Log.verbose(f"初始化 AsyncOpenAIRunner: model={model}, endpoint_url={endpoint_url}", module=MODULE)
@@ -585,6 +584,28 @@ class AsyncOpenAIRunner:
         self.cancellation_token = cancellation_token
         self._session: Optional[Any] = None
         self._tool_executor: Optional[ToolExecutor] = None
+
+    def _resolve_reasoning_tag(self, payloads: Dict[str, Any]) -> Optional[str]:
+        """根据当前请求负载动态解析应使用的推理内容标签。
+
+        Args:
+            payloads: 当前请求的完整负载字典。
+
+        Returns:
+            Optional[str]: 识别出的推理标签名（如 "thought"）；未识别或未启用则返回 None。
+
+        Raises:
+            无。
+        """
+        extra_body = payloads.get("extra_body", {})
+        google_config = extra_body.get("google", {}).get("thinking_config", {})
+
+        # 探测逻辑：仅当显式要求包含思维过程（include_thoughts 为 True）时，激活提取器。
+        # include_thoughts 是控制输出中是否存在 XML 标签的真源。
+        if google_config.get("include_thoughts") is True:
+            return "thought"
+
+        return None
 
     def _raise_if_cancelled(self) -> None:
         """检查当前 runner 是否已收到取消信号。"""
@@ -669,7 +690,7 @@ class AsyncOpenAIRunner:
         if not callable(getter):
             return False
         return bool(getter(tool_name))
-    
+
     def set_default_extra_payloads(self, payloads: Dict[str, Any]) -> None:
         """
         设置实例级默认请求参数。
@@ -815,13 +836,17 @@ class AsyncOpenAIRunner:
                 f"{log_prefix} ❌ {tool_call['name']} → {summary} ({latency_ms}ms)",
                 module=MODULE,
             )
-        return {
+        ret = {
             "id": tool_call["id"],
             "name": tool_call["name"],
             "arguments": tool_call["arguments"],
             "index_in_iteration": tool_call["index_in_iteration"],
             "result": tool_result,
         }
+        tc_extra = tool_call.get("extra_content")
+        if tc_extra is not None:
+            ret["extra_content"] = tc_extra
+        return ret
 
     async def _emit_tool_batch(
         self,
@@ -872,6 +897,9 @@ class AsyncOpenAIRunner:
                 display_name=display_name,
                 summary_params=summary_params,
             )
+            tc_extra = tc.get("extra_content")
+            if tc_extra is not None:
+                event.metadata["extra_content"] = tc_extra
             yield self._annotate_event(event, trace_meta)
 
         yield self._annotate_event(tool_calls_batch_ready(call_ids), trace_meta)  # ← 批次工具调用就绪事件
@@ -947,6 +975,9 @@ class AsyncOpenAIRunner:
                 result=result["result"],
                 display_name=result_display_name,
             )
+            tc_extra = result.get("extra_content")
+            if tc_extra is not None:
+                event.data["extra_content"] = tc_extra
             yield self._annotate_event(event, trace_meta)
 
         event = tool_calls_batch_done(            # ← 工具调用批次完成事件
@@ -967,18 +998,18 @@ class AsyncOpenAIRunner:
     ) -> AsyncIterator[StreamEvent]:
         """
         调用 OpenAI 兼容 API 并返回 streaming 事件流
-        
+
         支持自动重试：
         - 网络超时 → 重试
         - 50x 服务器错误 → 重试
         - 429 限流 → 根据 Retry-After 等待后重试
         - 40x 配置错误 → 不重试，立即返回
-        
+
         Args:
             messages: 消息列表（OpenAI 格式）
             stream: 是否启用 streaming
             **extra_payloads: 额外的请求参数，禁止覆盖 Runner 保留字段。
-        
+
         Returns:
             事件异步迭代器。
 
@@ -1008,14 +1039,14 @@ class AsyncOpenAIRunner:
         if stream and not self.supports_stream:
             Log.warn(f"{log_prefix} 模型配置不支持流式，自动降级为非流式模式", module=MODULE)
             stream = False
-        
+
         # 两层合并 extra payloads：实例默认 < 调用参数
         merged_extra_payloads = {}
         merged_extra_payloads.update(self.default_extra_payloads)
         if extra_payloads:
             Log.debug(f"{log_prefix} 传入调用级别的额外请求参数: {extra_payloads}", module=MODULE)
             merged_extra_payloads.update(extra_payloads)
-        
+
         # 1. 构建请求 payload
         payload = {
             "model": self.model,
@@ -1031,7 +1062,7 @@ class AsyncOpenAIRunner:
         # 流式 usage 采集：通过 stream_options 让服务端在最后一个 chunk 返回 usage
         if stream and self.supports_stream_usage:
             payload.setdefault("stream_options", {})["include_usage"] = True
-        
+
         # 添加工具定义（如果有且模型支持）
         if self._tool_executor and self.supports_tool_calling:
             tools = self._tool_executor.get_schemas()
@@ -1039,7 +1070,7 @@ class AsyncOpenAIRunner:
                 payload["tools"] = [self._tool_to_openai_spec(t) for t in tools]
         elif self._tool_executor and not self.supports_tool_calling:
             Log.warn(f"{log_prefix} 模型配置不支持工具调用，已忽略工具定义", module=MODULE)
-        
+
         # 检查 n 参数（多候选回答）
         n = payload.get("n", 1)
         if n > 1:
@@ -1049,7 +1080,7 @@ class AsyncOpenAIRunner:
                 module=MODULE,
             )
             payload["n"] = 1  # 强制覆盖为 1
-        
+
         # 2. 重试循环（复用同一 Runner 实例的 session，利用连接池）
         aiohttp_module = _require_aiohttp_module()
         request_timeout = self._build_request_timeout(stream=stream)
@@ -1087,6 +1118,9 @@ class AsyncOpenAIRunner:
                         Log.debug(f"{log_prefix} HTTP 200 成功（第 {attempt_number} 次尝试）", module=MODULE)
                         content_type = response.headers.get("Content-Type", "")
 
+                        # 动态解析当前请求应使用的标签（整个 200 块内共用一次解析结果）
+                        content_reasoning_tag = self._resolve_reasoning_tag(payload)
+
                         if "text/event-stream" in content_type:
                             if not stream:
                                 Log.debug(
@@ -1098,6 +1132,7 @@ class AsyncOpenAIRunner:
                                 request_id,
                                 trace_meta,
                                 attempt=attempt_number,
+                                content_reasoning_tag=content_reasoning_tag,
                             ):
                                 yield event
                         elif "application/json" in content_type or not stream:
@@ -1115,7 +1150,10 @@ class AsyncOpenAIRunner:
                                 log_prefix=f"[{self.name}]",
                                 log_module=MODULE,
                             )
-                            async for event in self._process_non_stream(result, request_id, trace_meta):
+                            async for event in self._process_non_stream(
+                                result, request_id, trace_meta,
+                                content_reasoning_tag=content_reasoning_tag,
+                            ):
                                 yield event
                         else:
                             if stream:
@@ -1124,6 +1162,7 @@ class AsyncOpenAIRunner:
                                     request_id,
                                     trace_meta,
                                     attempt=attempt_number,
+                                    content_reasoning_tag=content_reasoning_tag,
                                 ):
                                     yield event
                             else:
@@ -1136,7 +1175,10 @@ class AsyncOpenAIRunner:
                                     log_prefix=f"[{self.name}]",
                                     log_module=MODULE,
                                 )
-                                async for event in self._process_non_stream(result, request_id, trace_meta):
+                                async for event in self._process_non_stream(
+                                    result, request_id, trace_meta,
+                                    content_reasoning_tag=content_reasoning_tag,
+                                ):
                                     yield event
                         return
 
@@ -1342,7 +1384,7 @@ class AsyncOpenAIRunner:
                 unregister_cancellation_waiter()
             if cancellation_waiter is not None and not cancellation_waiter.done():
                 cancellation_waiter.cancel()
-    
+
     async def _process_sse_stream(
         self,
         response: "ClientResponse",
@@ -1350,6 +1392,7 @@ class AsyncOpenAIRunner:
         trace_meta: Dict[str, Any],
         *,
         attempt: int | None = None,
+        content_reasoning_tag: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """
         处理 SSE (Server-Sent Events) streaming 响应。
@@ -1375,6 +1418,7 @@ class AsyncOpenAIRunner:
             request_id=request_id,
             running_config=self.running_config,
             cancellation_token=self.cancellation_token,
+            content_reasoning_tag=content_reasoning_tag,
         )
         async for event in parser.parse_stream(response):
             yield self._annotate_event(event, trace_meta)
@@ -1555,6 +1599,7 @@ class AsyncOpenAIRunner:
         result: Dict,
         request_id: str,
         trace_meta: Dict[str, Any],
+        content_reasoning_tag: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """
         处理非 streaming 响应（完整 JSON）。
@@ -1576,7 +1621,7 @@ class AsyncOpenAIRunner:
                 error_type="response_error",
             )
             return
-        
+
         # 只处理第一个回答（如果 n > 1，其余候选回答会被忽略，请求时已警告）
         first_choice = choices[0]
         if not isinstance(first_choice, dict):
@@ -1596,7 +1641,7 @@ class AsyncOpenAIRunner:
                 error_type="response_error",
             )
             return
-        
+
         # 内容
         content = message.get("content")
         if content is None:
@@ -1609,9 +1654,10 @@ class AsyncOpenAIRunner:
             yield self._annotate_event(reasoning_delta(reasoning_content_text), trace_meta)
 
         if content:
-            # 有别于流式响应，这里一次性返回完整内容
-            yield self._annotate_event(content_delta(content), trace_meta)        # ← 内容增量事件
-        
+            # 有别于流式响应，这里一次性返回完整内容，但我们仍需剥离私有 <thought> 标签
+            async for event in self._yield_non_stream_content(content, tag_name=content_reasoning_tag):
+                yield self._annotate_event(event, trace_meta)
+
         # 工具调用
         # NOTE: legacy function_call is not supported; only tool_calls are processed.
         # NOTE: code review: dot NOT check for function_call support here.
@@ -1712,24 +1758,30 @@ class AsyncOpenAIRunner:
                         body=json.dumps([f"tool_index {idx}: arguments is not object"], ensure_ascii=False),
                     )
                     return
-                
+
                 # 有别于流式响应，这里一次性返回完整参数
                 yield self._annotate_event(
                     tool_call_start(tool_name=name, tool_call_id=tc_id),
                     trace_meta,
                 )   # ← 工具调用开始事件
-                tool_call_batch.append({
+                item: Dict[str, Any] = {
                     "id": tc_id,
                     "name": name,
                     "arguments": args_obj,
                     "index_in_iteration": idx,
-                })
-            
+                }
+                # 提取可能的额外内容（如 Gemini 的 thought_signature）
+                tc_extra = tc.get("extra_content")
+                if tc_extra is not None:
+                    item["extra_content"] = tc_extra
+
+                tool_call_batch.append(item)
+
             async for event in self._emit_tool_batch(tool_call_batch, request_id, trace_meta):
                 yield event
                 if event.type == EventType.ERROR:
                     return
-        
+
         # 总是 yield content_complete，即使内容为空（保持与 SSE 流式一致）
         cc_kwargs_ns: Dict[str, Any] = {}
         if reasoning_content_text:
@@ -1781,20 +1833,20 @@ class AsyncOpenAIRunner:
                 }),
                 trace_meta,
             )
-    
+
     def _calculate_backoff(self, attempt: int, response: "ClientResponse") -> float:
         """
         计算重试等待时间
-        
+
         Args:
             attempt: 当前重试次数（0-based）
             response: HTTP 响应对象
-        
+
         Returns:
             等待秒数
         """
         status = response.status
-        
+
         # 429 限流：优先使用 Retry-After 头
         if status == 429:
             retry_after = response.headers.get("Retry-After")
@@ -1802,16 +1854,50 @@ class AsyncOpenAIRunner:
                 delay = int(retry_after)
                 Log.debug(f"使用 Retry-After 头部: {delay}s", module=MODULE)
                 return min(delay, 120)  # 最多等待 2 分钟
-            
+
             # 没有 Retry-After，使用指数退避（429 用更长时间）
             delay = min(60, 4 * (2 ** attempt))  # 4s, 8s, 16s, 32s, 60s
             Log.debug(f"限流退避: {delay}s", module=MODULE)
             return delay
-        
+
         # 其他可重试错误：标准指数退避
         delay = min(30, 2 ** attempt)  # 1s, 2s, 4s, 8s, 16s, 30s
         Log.debug(f"标准退避: {delay}s", module=MODULE)
         return delay
+
+    async def _yield_non_stream_content(self, content: str, tag_name: str | None = None) -> AsyncIterator[StreamEvent]:
+        """非流式路径下的内容分发（支持 XML 标签剥离）。
+
+        Args:
+            content: 待分发的完整内容字符串。
+            tag_name: 需要拦截并分离的 XML 标签名（如 "thought"）。
+
+        Yields:
+            StreamEvent: reasoning_delta（如果有提取内容）及 content_delta 事件。
+
+        Raises:
+            无。
+        """
+        if not tag_name:
+            yield content_delta(content)
+            return
+
+        extractor = StreamingXMLTagExtractor(tag_name, enabled=True)
+        content_parts = []
+        reasoning_parts = []
+
+        # 非流式直接处理全量并 flush
+        for text, is_thought in extractor.process(content) + extractor.flush():
+            if is_thought:
+                reasoning_parts.append(text)
+            else:
+                content_parts.append(text)
+
+        if reasoning_parts:
+            yield reasoning_delta("".join(reasoning_parts))
+
+        if content_parts:
+            yield content_delta("".join(content_parts))
 
     def _annotate_event(self, event: StreamEvent, trace_meta: Dict[str, Any]) -> StreamEvent:
         metadata = dict(event.metadata) if event.metadata else {}
@@ -1867,7 +1953,7 @@ class AsyncOpenAIRunner:
         if partial_tool_name is not None:
             metadata["partial_tool_name"] = partial_tool_name
         return metadata
-    
+
     def _tool_to_openai_spec(self, tool: Dict) -> Dict:
         """
         将工具字典转换为 OpenAI 工具规范。
@@ -1881,7 +1967,7 @@ class AsyncOpenAIRunner:
         # 如果已经是 OpenAI 格式，直接返回
         if "type" in tool and "function" in tool:
             return tool
-        
+
         # 否则从简化格式转换
         return {
             "type": "function",

@@ -512,7 +512,8 @@
       "extra_body": {
         "google": {
           "thinking_config": {
-            "thinking_budget": 0
+            "thinking_budget": -1,
+            "include_thoughts": true
           }
         }
       }
@@ -525,7 +526,7 @@
     "supports_usage": true,
     "supports_stream_usage": false,
     "max_context_tokens": 1048576,
-    "description": "Google Gemini 2.5 Flash thinking - 当前与非 thinking 档同配（thinking_budget=0）。真正的 thinking 模式在 runner 未实现 thought_signature 透传前暂不启用，见 GitHub issue。",
+    "description": "Google Gemini 2.5 Flash thinking - thinking_budget=-1（动态） + include_thoughts=true；thought_signature 透传已实现，支持多轮工具调用",
     "runtime_hints": {
       "temperature_profiles": {
         "write": {

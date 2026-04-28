@@ -611,6 +611,46 @@ class TestAsyncOpenAIRunnerProcessNonStream:
         assert done_events[0].data["content_filtered"] is True
         assert done_events[0].data["finish_reason"] == "content_filter"
 
+    async def test_process_non_stream_extra_content_preservation(self):
+        """验证非流式响应中的 extra_content 是否被正确透传。"""
+        runner = AsyncOpenAIRunner(
+            endpoint_url="https://api.example.com",
+            model="gpt-4",
+            headers={},
+        )
+        # Mock executor 以支持 _emit_tool_batch
+        mock_executor = MagicMock()
+        mock_executor.get_tool_display_info.return_value = ("Search", [])
+        runner.set_tools(mock_executor)
+
+        result = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "function": {"name": "tool", "arguments": "{}"},
+                                "extra_content": {"thought_signature": "TEST_SIG"}
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+        events = []
+        trace_meta = {"run_id": "r", "iteration_id": "i", "request_id": "req"}
+        async for event in runner._process_non_stream(result, "req", trace_meta):
+            events.append(event)
+
+        # 验证工具调用已发起事件中是否带有 extra_content
+        dispatch_events = [e for e in events if e.type == EventType.TOOL_CALL_DISPATCHED]
+        assert len(dispatch_events) == 1
+        assert dispatch_events[0].metadata.get("extra_content") == {"thought_signature": "TEST_SIG"}
+
 
 @pytest.mark.skipif(not AIOHTTP_AVAILABLE, reason="aiohttp not installed")
 @pytest.mark.asyncio

@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Protocol, TypeAlias, TypedDict
+from typing import Literal, NotRequired, Protocol, TypeAlias, TypedDict
 
 
 class FunctionToolCallPayload(TypedDict):
@@ -23,6 +23,7 @@ class ToolCallPayload(TypedDict):
     id: str
     type: Literal["function"]
     function: FunctionToolCallPayload
+    extra_content: NotRequired[dict[str, dict[str, object]]]
 
 
 class SystemChatMessage(TypedDict):
