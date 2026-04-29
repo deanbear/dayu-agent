@@ -20,6 +20,7 @@ Runner 协议适配层内（``SSEStreamParser`` + ``reasoning_protocol`` +
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any, AsyncIterator, Dict, Iterable, List
 
 import pytest
@@ -147,16 +148,16 @@ async def test_assistant_message_for_next_turn_has_no_thought() -> None:
 def test_async_agent_source_is_thought_agnostic() -> None:
     """守护测试：``dayu/engine/async_agent.py`` 源码不应出现 vendor 协议字面量。
 
-    任何在 AsyncAgent 里出现的 ``<thought>`` / ``thought`` 字面量都意味着
-    vendor 协议泄漏到了上层，违反"协议归一化在 Engine 协议适配层完成"的承诺。
+    这里禁止的是明确的 vendor 协议 token，而不是任意包含 ``thought``
+    子串的英文注释/标识符，避免把无关文字误报成协议泄漏。
     """
 
     project_root = Path(__file__).resolve().parents[2]
     source_path = project_root / "dayu" / "engine" / "async_agent.py"
     source = source_path.read_text(encoding="utf-8")
-    assert "<thought" not in source, "AsyncAgent 不应出现 <thought 字面量"
-    assert "</thought" not in source, "AsyncAgent 不应出现 </thought 字面量"
-    # 大小写不敏感地排除 thought 标识符使用
-    assert "thought" not in source.lower(), (
-        "AsyncAgent 不应出现 'thought' 标识符（vendor 私有协议必须封装在 Runner 内）"
+    assert re.search(r"<\s*/?\s*thought\b", source, re.IGNORECASE) is None, (
+        "AsyncAgent 不应出现 <thought> vendor 标签字面量"
+    )
+    assert "thought_signature" not in source, (
+        "AsyncAgent 不应出现 thought_signature vendor 协议字段"
     )
