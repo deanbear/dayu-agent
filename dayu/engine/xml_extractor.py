@@ -118,6 +118,13 @@ class StreamingXMLTagExtractor:
         """
         在流结束（或接收完毕）时调用，强制输出缓冲中残留的片段。
 
+        语义约束：
+            ``flush`` 是**终态**调用——它表示当前数据流已经全部到达。
+            返回后实例不再保证可在另一个独立数据流上复用：
+            ``_is_active`` 与 ``_has_seen_non_whitespace`` 不会被重置，
+            因此一旦在前一个流里失活，后续 ``process`` 仍会原样放行。
+            如需在新流上重新启用，请直接构造新实例。
+
         Returns:
             List[Tuple[str, bool]]: 残留的提取结果。
         """
@@ -125,6 +132,45 @@ class StreamingXMLTagExtractor:
             return []
         res = [(self._buffer, self._in_tag)]
         self._buffer = ""
-        # 流结束时重置状态
+        # 仅重置 buffer 与 in_tag；安全锁 (_is_active / _has_seen_non_whitespace)
+        # 不重置以保持单流终态语义。
         self._in_tag = False
         return res
+
+
+def extract_full(
+    text: str,
+    tag_name: str,
+    *,
+    start_only: bool = True,
+) -> Tuple[str, str]:
+    """对完整文本一次性执行 XML 标签剥离（非流式专用）。
+
+    封装 ``StreamingXMLTagExtractor.process(text) + flush()``，
+    把多片段结果按 ``(标签外正文, 标签内提取内容)`` 两个分量拼接返回。
+
+    Args:
+        text: 待处理的完整文本。
+        tag_name: 需要剥离的 XML 标签名（如 "thought"）。
+        start_only: 是否启用"仅在文本开头识别标签"的安全锁；
+            默认 True，与流式路径保持一致。
+
+    Returns:
+        ``(stripped, extracted)``：
+            - ``stripped``：剥离标签后的正文；
+            - ``extracted``：标签内部提取出的内容（多个标签会按出现顺序拼接）。
+
+    Raises:
+        无。
+    """
+
+    extractor = StreamingXMLTagExtractor(tag_name, start_only=start_only, enabled=True)
+    parts = extractor.process(text) + extractor.flush()
+    stripped_parts: List[str] = []
+    extracted_parts: List[str] = []
+    for chunk_text, is_inside in parts:
+        if is_inside:
+            extracted_parts.append(chunk_text)
+        else:
+            stripped_parts.append(chunk_text)
+    return "".join(stripped_parts), "".join(extracted_parts)

@@ -54,7 +54,11 @@ class SSEParseResult:
     SSE 流解析的最终结果。
 
     Attributes:
-        content: 拼接后的完整文本内容。
+        content: 已剥离 vendor 私有 reasoning 标签后的正文，与对外
+            ``CONTENT_DELTA`` 事件累计同源；不包含 ``<thought>`` 等私有标签。
+        reasoning_content: 合并后的推理内容，包括原生 ``reasoning_content``
+            字段与从私有标签内剥离出的内容；与 ``REASONING_DELTA`` 事件
+            累计同源。
         tool_calls: 验证通过的工具调用列表（每项含 id/name/arguments/index_in_iteration）。
         stream_state: 流式状态字典（finish_reason、saw_choice 等）。
         done_received: 是否收到 [DONE] 标记。
@@ -581,11 +585,13 @@ class SSEStreamParser:
             return
 
         # 3) 累积内容增量
+        # 不变量：``_content_buffer`` 永远只承载"剥离 vendor 私有 reasoning
+        # 标签后的正文"，与对外发出的 ``CONTENT_DELTA`` 累计同源。原始含
+        # 标签的字节流不在 parser 边界外暴露 —— 这是协议归一化的核心承诺。
+        # 因此原文统一交给 ``_yield_content_chunks`` 内部按是否在标签内分流
+        # 写入 ``_content_buffer`` / ``_reasoning_content_buffer``。
         if "content" in delta and delta["content"]:
             text = delta["content"]
-            # [重要] 始终在内容缓冲区记录原始文本（包含 <thought> 标签）。
-            # 这样 get_result() 返回的 content 是完整的，以便下一轮请求能带回给模型。
-            self._content_buffer.append(text)
             async for event in self._yield_content_chunks(text):
                 yield event
 
@@ -934,7 +940,12 @@ class SSEStreamParser:
         return partial_tool_calls
 
     async def _yield_content_chunks(self, text: str) -> AsyncIterator[StreamEvent]:
-        """处理并分发内容块（支持 Gemini 思维链提取）。
+        """处理并分发内容块，按是否位于 vendor 私有 reasoning 标签内分流累计。
+
+        不变量：
+            - 标签外的正文 → 累入 ``_content_buffer`` + 发 ``CONTENT_DELTA``。
+            - 标签内的内容 → 累入 ``_reasoning_content_buffer`` + 发 ``REASONING_DELTA``。
+            - 提取器未启用时，全部按"标签外正文"对待。
 
         Args:
             text: 待处理的原始增量文本。
@@ -946,6 +957,7 @@ class SSEStreamParser:
             无。
         """
         if not self._thought_extractor.enabled:
+            self._content_buffer.append(text)
             yield content_delta(text)
             return
 
@@ -954,10 +966,11 @@ class SSEStreamParser:
                 self._reasoning_content_buffer.append(extracted_text)
                 yield reasoning_delta(extracted_text)
             else:
+                self._content_buffer.append(extracted_text)
                 yield content_delta(extracted_text)
 
     async def _yield_final_content(self) -> AsyncIterator[StreamEvent]:
-        """冲刷并分发残留的内容块（支持 Gemini 思维链提取）。
+        """冲刷并分发残留的内容块（与 ``_yield_content_chunks`` 共享分流不变量）。
 
         Returns:
             AsyncIterator[StreamEvent]: 流结束时残留的 content_delta 或 reasoning_delta 事件流。
@@ -973,4 +986,5 @@ class SSEStreamParser:
                 self._reasoning_content_buffer.append(extracted_text)
                 yield reasoning_delta(extracted_text)
             else:
+                self._content_buffer.append(extracted_text)
                 yield content_delta(extracted_text)

@@ -148,7 +148,7 @@ class ToolExecutor(Protocol):
 - `DefaultHostExecutor` 会在写 transcript 前再次检查取消，取消 run 不再把本轮回答持久化进会话 transcript
 - `SSEStreamParser` 的取消观察边界与 Runner 对齐：流式解析在 heartbeat 空转等待和下一块分片读取期间也必须继续观察同一令牌，不能等到整段流结束后才统一发现取消
 - `SSEStreamParser` 使用的取消等待回调同样必须是“按轮注册、按轮注销”；成功解析、异常退出和外层任务取消都不能留下悬空回调或后台 chunk 读取 task
-- `SSEStreamParser` 实现了自适应 XML 标签提取逻辑：支持根据 `content_reasoning_tag` 参数在流式解析过程中实时拦截并分离特定的标签内容（如 Gemini 的 `<thought>`），将其转化为 `reasoning_delta` 事件，确保内容与推理过程在协议层即实现解耦
+- `SSEStreamParser` 实现了自适应 XML 标签提取逻辑：支持根据 `content_reasoning_tag` 参数在流式解析过程中实时拦截并分离特定的标签内容（如 Gemini 的 `<thought>`），将其转化为 `reasoning_delta` 事件，确保内容与推理过程在协议层即实现解耦。vendor 私有 reasoning 表达（如 `<thought>`）只在 Runner 边界内存在；跨过 Runner 后，`CONTENT_*` / `FINAL_ANSWER` / 下一轮 assistant message / Host 持久化 / 压缩链路统一只看到剥离后的正文，`AsyncAgent` 及以上层对 vendor 标签完全无感
 
 当前 web tools 的内部边界：
 - `search_web` 的 provider 选择、API 调用与结果组装真源已经下沉到 `dayu.engine.tools.web_search_providers`
@@ -294,7 +294,7 @@ Engine 自己不做 run registry，也不做跨进程取消桥接。
 - 按 `debug_sse` / `debug_sse_sample_rate` / `debug_sse_throttle_sec` 做 SSE 调试日志采样与节流
 - 工具调用批次执行
 - 错误分类与可恢复重试
-- 请求意图自适应解析：负责在请求生命周期内根据请求负载动态解析推理标签（如自适应识别 Google 的 `thinking_config`），并指导解析器执行内容分离
+- 请求意图自适应解析：统一委托 `dayu.engine.reasoning_protocol` 完成 vendor 私有 reasoning 协议探测，按注册式承载多 provider 扩展（当前覆盖 Google `thinking_config.include_thoughts`），Runner 主路径只调用统一入口拿到 `tag_name`，并在非流式路径上经由 `xml_extractor.extract_full` 完成"剥离正文 + 合并 native reasoning_content"
 - 为单次 tool call 生成 linked `ToolExecutionContext`，并在 tool timeout / run cancel 时先触发 linked cancellation token
 
 ### 8.2 AsyncCliRunner
@@ -330,7 +330,10 @@ Engine 自己不做 run registry，也不做跨进程取消桥接。
 
 任何对事件顺序、字段或语义的修改，都必须同步更新：
 - `tests/engine/test_async_agent.py`
+- `tests/engine/test_async_agent_reasoning.py`
 - `tests/engine/test_async_openai_runner*.py`
+- `tests/engine/test_sse_parser.py`
+- `tests/engine/test_reasoning_protocol.py`
 - `tests/engine/test_context_budget.py`
 
 ## 10. 代码阅读顺序

@@ -120,7 +120,8 @@ from .events import (
     tool_calls_batch_ready, ## """创建工具调用批次就绪事件"""
     tool_calls_batch_done,  ## """创建工具调用批次完成事件"""
 )
-from .xml_extractor import StreamingXMLTagExtractor
+from .xml_extractor import extract_full
+from .reasoning_protocol import resolve_reasoning_protocol
 from .protocols import ToolExecutor
 from dayu.log import Log
 from .tool_result import (
@@ -586,7 +587,11 @@ class AsyncOpenAIRunner:
         self._tool_executor: Optional[ToolExecutor] = None
 
     def _resolve_reasoning_tag(self, payloads: Dict[str, Any]) -> Optional[str]:
-        """根据当前请求负载动态解析应使用的推理内容标签。
+        """根据当前请求负载解析应使用的 vendor 私有 reasoning 标签名。
+
+        实际探测逻辑由 :mod:`dayu.engine.reasoning_protocol` 注册表承载，
+        Runner 主路径只消费归一化后的 ``tag_name`` 字符串。新增 provider 时
+        在协议适配层追加 detector，不修改本方法。
 
         Args:
             payloads: 当前请求的完整负载字典。
@@ -597,15 +602,7 @@ class AsyncOpenAIRunner:
         Raises:
             无。
         """
-        extra_body = payloads.get("extra_body", {})
-        google_config = extra_body.get("google", {}).get("thinking_config", {})
-
-        # 探测逻辑：仅当显式要求包含思维过程（include_thoughts 为 True）时，激活提取器。
-        # include_thoughts 是控制输出中是否存在 XML 标签的真源。
-        if google_config.get("include_thoughts") is True:
-            return "thought"
-
-        return None
+        return resolve_reasoning_protocol(payloads).tag_name
 
     def _raise_if_cancelled(self) -> None:
         """检查当前 runner 是否已收到取消信号。"""
@@ -1643,19 +1640,33 @@ class AsyncOpenAIRunner:
             return
 
         # 内容
-        content = message.get("content")
-        if content is None:
-            content = ""
+        raw_content = message.get("content")
+        if raw_content is None:
+            raw_content = ""
 
-        # 推理内容（thinking 模式思维链）
-        reasoning_content_text = message.get("reasoning_content") or ""
+        # 协议归一化：把 vendor 私有 reasoning 标签内容从正文剥离，与原生
+        # ``message.reasoning_content`` 合并后作为唯一的 reasoning 真源；
+        # 跨过这里之后，非流式与流式路径产出的事件序列与最终
+        # ``content_complete.metadata.reasoning_content`` 完全等价。
+        if content_reasoning_tag:
+            stripped_content, extracted_reasoning = extract_full(
+                raw_content, content_reasoning_tag,
+            )
+        else:
+            stripped_content, extracted_reasoning = raw_content, ""
 
-        if reasoning_content_text:
-            yield self._annotate_event(reasoning_delta(reasoning_content_text), trace_meta)
+        native_reasoning = message.get("reasoning_content") or ""
+        # 与 SSE 路径合并顺序对齐：在同一条 message 内，``content`` 中
+        # ``<thought>`` 抽出的片段先被消费，``reasoning_content`` 字段后追加
+        # （见 ``SSEStreamParser._handle_payload`` 对 ``delta`` 的处理顺序）。
+        # 任一侧改写都必须同时改另一侧，否则破坏 SSE↔non-stream 协议等价。
+        merged_reasoning = extracted_reasoning + native_reasoning
 
-        if content:
-            # 有别于流式响应，这里一次性返回完整内容，但我们仍需剥离私有 <thought> 标签
-            async for event in self._yield_non_stream_content(content, tag_name=content_reasoning_tag):
+        if merged_reasoning:
+            yield self._annotate_event(reasoning_delta(merged_reasoning), trace_meta)
+
+        if stripped_content:
+            async for event in self._yield_non_stream_content(stripped_content):
                 yield self._annotate_event(event, trace_meta)
 
         # 工具调用
@@ -1782,11 +1793,15 @@ class AsyncOpenAIRunner:
                 if event.type == EventType.ERROR:
                     return
 
-        # 总是 yield content_complete，即使内容为空（保持与 SSE 流式一致）
+        # 总是 yield content_complete，即使内容为空（保持与 SSE 流式一致）。
+        # 真源约束：``content_complete.data`` = 已剥离 vendor 私有标签后的正文；
+        # ``metadata.reasoning_content`` = 合并后的 reasoning（与 SSE 路径等价）。
         cc_kwargs_ns: Dict[str, Any] = {}
-        if reasoning_content_text:
-            cc_kwargs_ns["reasoning_content"] = reasoning_content_text
-        yield self._annotate_event(content_complete(content, **cc_kwargs_ns), trace_meta)         # ← 内容完成事件
+        if merged_reasoning:
+            cc_kwargs_ns["reasoning_content"] = merged_reasoning
+        yield self._annotate_event(
+            content_complete(stripped_content, **cc_kwargs_ns), trace_meta,
+        )         # ← 内容完成事件
         # 非流式 finish_reason 截断检测
         non_stream_finish = choices[0].get("finish_reason")
         truncated = non_stream_finish == "length"
@@ -1809,7 +1824,7 @@ class AsyncOpenAIRunner:
             non_stream_usage = None
         # 构建并发送 DONE 事件（含 usage）
         done_summary: Dict[str, Any] = {
-            "total_chars": len(content),
+            "total_chars": len(stripped_content),
             "tool_calls": len(tool_calls),
             "truncated": truncated,
             "content_filtered": content_filtered,
@@ -1865,39 +1880,27 @@ class AsyncOpenAIRunner:
         Log.debug(f"标准退避: {delay}s", module=MODULE)
         return delay
 
-    async def _yield_non_stream_content(self, content: str, tag_name: str | None = None) -> AsyncIterator[StreamEvent]:
-        """非流式路径下的内容分发（支持 XML 标签剥离）。
+    async def _yield_non_stream_content(self, content: str) -> AsyncIterator[StreamEvent]:
+        """非流式路径下的内容分发（已剥离 vendor 私有 reasoning 标签）。
+
+        本方法**只**产出剥离后的正文 ``CONTENT_DELTA``。从标签内剥离出的
+        reasoning 不在此处产出 ``REASONING_DELTA``——它由 ``_process_non_stream``
+        统一与原生 ``message.reasoning_content`` 合并后一次性发出，确保
+        SSE 与非流式两条路径在 ``REASONING_*`` 事件时序与
+        ``content_complete.metadata.reasoning_content`` 上完全等价。
 
         Args:
-            content: 待分发的完整内容字符串。
-            tag_name: 需要拦截并分离的 XML 标签名（如 "thought"）。
+            content: 已剥离 vendor 标签后的正文（由调用方预先剥离）。
 
         Yields:
-            StreamEvent: reasoning_delta（如果有提取内容）及 content_delta 事件。
+            StreamEvent: 仅产出 ``content_delta`` 事件（若 content 非空）。
 
         Raises:
             无。
         """
-        if not tag_name:
-            yield content_delta(content)
+        if not content:
             return
-
-        extractor = StreamingXMLTagExtractor(tag_name, enabled=True)
-        content_parts = []
-        reasoning_parts = []
-
-        # 非流式直接处理全量并 flush
-        for text, is_thought in extractor.process(content) + extractor.flush():
-            if is_thought:
-                reasoning_parts.append(text)
-            else:
-                content_parts.append(text)
-
-        if reasoning_parts:
-            yield reasoning_delta("".join(reasoning_parts))
-
-        if content_parts:
-            yield content_delta("".join(content_parts))
+        yield content_delta(content)
 
     def _annotate_event(self, event: StreamEvent, trace_meta: Dict[str, Any]) -> StreamEvent:
         metadata = dict(event.metadata) if event.metadata else {}

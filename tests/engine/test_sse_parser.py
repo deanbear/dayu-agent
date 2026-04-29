@@ -1440,7 +1440,11 @@ async def test_gemini_tool_call_preserves_extra_content() -> None:
 
 @pytest.mark.asyncio
 async def test_gemini_thinking_content_extracted_to_reasoning() -> None:
-    """验证 Gemini thinking 内容（含 <thought> 标签）被正确分离为 reasoning_content。"""
+    """验证 Gemini thinking 内容（含 <thought> 标签）被正确分离为 reasoning_content。
+
+    本用例 chunks 全部位于 ``<thought>...</thought>`` 内部、不含其他正文，
+    因此 ``result.content`` 必须为空字符串（已剥离 vendor 私有标签）。
+    """
     parser = SSEStreamParser(
         name="gemini",
         request_id="req_thinking",
@@ -1484,8 +1488,9 @@ async def test_gemini_thinking_content_extracted_to_reasoning() -> None:
     events = await _collect_events(_parse_stream(parser, response))
     result = parser.get_result()
 
-    # content 必须包含原始标签（用于历史回传），而 reasoning_content 是脱水后的内容（用于 UI）
-    assert result.content == "<thought>**Analyzing**\n\n</thought>"
+    # 协议归一化承诺：跨过 parser 边界后，``content`` 永远是剥离 vendor
+    # 私有标签后的正文；本用例输入全是 thought，所以 content 为空。
+    assert result.content == ""
     assert result.reasoning_content == "**Analyzing**\n\n"
 
     # 被转为 REASONING_DELTA 事件
@@ -1493,9 +1498,50 @@ async def test_gemini_thinking_content_extracted_to_reasoning() -> None:
     assert len(reasoning_events) == 1
     assert reasoning_events[0].data == "**Analyzing**\n\n"
 
+    # 不应产出任何 CONTENT_DELTA（thought 不应泄露到正文事件）
+    content_events = [e for e in events if e.type == EventType.CONTENT_DELTA]
+    assert content_events == []
+
     # tool call 组装正确，含 extra_content
     assert len(result.tool_calls) == 1
     assert result.tool_calls[0].get("extra_content") == {"google": {"thought_signature": thought_signature}}
+
+
+@pytest.mark.asyncio
+async def test_gemini_thinking_mixed_with_normal_content() -> None:
+    """混合输入：``<thought>X</thought>Y`` 必须严格分流。
+
+    - ``result.content == "Y"``（剥离版正文，不含标签）
+    - ``result.reasoning_content == "X"``
+    - ``CONTENT_DELTA`` 累计 == "Y"；``REASONING_DELTA`` 累计 == "X"
+    - 两类事件累计必须与 ``result`` 字段同源（核心不变量）
+    """
+    parser = SSEStreamParser(
+        name="gemini",
+        request_id="req_mixed",
+        running_config=_RunningConfigStub(),
+        content_reasoning_tag="thought",
+    )
+    chunk1 = json.dumps({"choices": [{"delta": {"content": "<thought>analyz"}}]})
+    chunk2 = json.dumps({"choices": [{"delta": {"content": "ing</thought>final "}}]})
+    chunk3 = json.dumps({"choices": [{"delta": {"content": "answer"}, "finish_reason": "stop"}]})
+
+    response = _ResponseStub([
+        f"data: {chunk1}\n\n".encode("utf-8"),
+        f"data: {chunk2}\n\n".encode("utf-8"),
+        f"data: {chunk3}\n\n".encode("utf-8"),
+        b"data: [DONE]\n\n",
+    ])
+    events = await _collect_events(_parse_stream(parser, response))
+    result = parser.get_result()
+
+    assert result.content == "final answer"
+    assert result.reasoning_content == "analyzing"
+
+    content_acc = "".join(e.data for e in events if e.type == EventType.CONTENT_DELTA)
+    reasoning_acc = "".join(e.data for e in events if e.type == EventType.REASONING_DELTA)
+    assert content_acc == "final answer"
+    assert reasoning_acc == "analyzing"
 
 
 @pytest.mark.asyncio
